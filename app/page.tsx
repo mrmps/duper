@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
-import { uploadImage, getVisualMatches } from "./actions";
+import React, { useState, useMemo, useEffect } from "react";
+import { uploadImage, getInitialResults, getDetectedObjectResults } from "./actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,6 +27,12 @@ interface UploadFormProps {
   onUploadSuccess: (imageId: string, imageUrl: string) => void;
 }
 
+export interface DetectedObject {
+  name: string;
+  croppedImageUrl: string;
+  products: Product[];
+}
+
 export interface Product {
   title: string;
   link: string;
@@ -37,12 +43,8 @@ export interface Product {
     currency: string;
   };
   source: string;
-}
-
-export interface DetectedObject {
-  name: string;
+  category: string;
   croppedImageUrl: string;
-  products: Product[];
 }
 
 function UploadForm({ onUploadSuccess }: UploadFormProps) {
@@ -176,10 +178,17 @@ function ObjectSelector({
 }: {
   objects: DetectedObject[];
   selectedObject: DetectedObject | null;
-  onObjectChange: (object: DetectedObject) => void;
+  onObjectChange: (object: DetectedObject | null) => void;
 }) {
   return (
     <div className="flex flex-wrap gap-2 mb-4">
+      <Button
+        variant={selectedObject === null ? "default" : "outline"}
+        onClick={() => onObjectChange(null)}
+        className="flex items-center gap-2"
+      >
+        All Products
+      </Button>
       {objects.map((object) => (
         <Button
           key={object.croppedImageUrl}
@@ -202,6 +211,7 @@ function ObjectSelector({
 export default function Home() {
   const [uploadedImageId, setUploadedImageId] = useState<string | null>(null);
   const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null);
+  const [initialProducts, setInitialProducts] = useState<Product[]>([]);
   const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
   const [selectedObject, setSelectedObject] = useState<DetectedObject | null>(null);
   const [loading, setLoading] = useState(false);
@@ -211,39 +221,37 @@ export default function Home() {
     setUploadedImageId(imageId);
     setUploadedImageUrl(imageUrl);
     setLoading(true);
+    setSelectedObject(null);
+    setInitialProducts([]);
+    setDetectedObjects([]);
+  
     try {
-      const fetchedProducts = await getVisualMatches(imageId);
-      const groupedObjects = fetchedProducts.reduce((acc, product) => {
-        const existingObject = acc.find(obj => obj.croppedImageUrl === product.croppedImageUrl);
-        if (existingObject) {
-          existingObject.products.push(product);
-        } else {
-          acc.push({
-            name: product.category,
-            croppedImageUrl: product.croppedImageUrl,
-            products: [product]
-          });
-        }
-        return acc;
-      }, [] as DetectedObject[]);
-      
-      setDetectedObjects(groupedObjects);
-      setSelectedObject(groupedObjects[0] || null);
+      // Get initial results
+      const initialResults: Product[] = await getInitialResults(imageId);
+      setInitialProducts(initialResults);
+  
+      // Get detected object results
+      const objectResults: DetectedObject[] = await getDetectedObjectResults(imageId);
+      setDetectedObjects(objectResults);
     } catch (error) {
-      console.error("Error fetching similar products:", error);
+      console.error("Error fetching results:", error);
     } finally {
       setLoading(false);
     }
   };
 
+  const handleObjectChange = (object: DetectedObject | null) => {
+    setSelectedObject(object);
+  };
+
   const sortedProducts = useMemo(() => {
-    if (!selectedObject) return [];
-    return [...selectedObject.products].sort((a, b) => {
+    const productsToSort = selectedObject ? selectedObject.products : initialProducts;
+    return [...productsToSort].sort((a, b) => {
       const priceA = a.price?.extracted_value || 0;
       const priceB = b.price?.extracted_value || 0;
       return sortOrder === "asc" ? priceA - priceB : priceB - priceA;
     });
-  }, [selectedObject, sortOrder]);
+  }, [selectedObject, initialProducts, sortOrder]);
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-between p-4 md:p-24">
@@ -273,11 +281,14 @@ export default function Home() {
                 />
               </div>
             )}
-            <ObjectSelector
-              objects={detectedObjects}
-              selectedObject={selectedObject}
-              onObjectChange={setSelectedObject}
-            />
+            {detectedObjects.length > 0 && (
+              <ObjectSelector
+                objects={detectedObjects}
+                selectedObject={selectedObject}
+                onObjectChange={handleObjectChange}
+              />
+            )}
+            {/* {JSON.stringify(selectedObject)} */}
             <Select onValueChange={(value) => setSortOrder(value as "asc" | "desc")}>
               <SelectTrigger className="w-[180px] mb-4">
                 <SelectValue placeholder="Sort by price" />

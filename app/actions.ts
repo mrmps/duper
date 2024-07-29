@@ -2,9 +2,8 @@
 
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import sharp from 'sharp';
-import type { Product } from "./page";
+import { Product } from "./page";
 
-// Set up the S3 client for Cloudflare R2
 const s3Client = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -44,11 +43,6 @@ export interface SerpApiResponse {
   visual_matches: Product[];
 }
 
-export interface InteractiveFashionImageProps {
-  imageUrl: string;
-  onObjectClick: (object: DetectedObject) => void;
-}
-
 export interface UploadResponse {
   imageId: string;
   imageUrl: string;
@@ -60,10 +54,6 @@ export interface ErrorResponse {
 
 export type UploadResult = UploadResponse | ErrorResponse;
 
-export type UploadImageFunction = (formData: FormData) => Promise<UploadResult>;
-export type GetVisualMatchesFunction = (imageId: string) => Promise<(Product & { category: string; croppedImageUrl: string })[]>;
-
-// Function to upload an image
 export async function uploadImage(formData: FormData): Promise<UploadResult> {
   const file = formData.get('image') as File
   
@@ -92,17 +82,38 @@ export async function uploadImage(formData: FormData): Promise<UploadResult> {
   }
 }
 
-// Function to crop and upload an image
+export async function getInitialResults(imageId: string): Promise<Product[]> {
+  if (!process.env.SERPAPI_KEY) {
+    throw new Error("SERPAPI_KEY is not defined");
+  }
+
+  const imageUrl = `${process.env.CLOUDFLARE_PUBLIC_URL}/${imageId}`;
+
+  const serpApiResponse = await fetch(
+    `https://serpapi.com/search.json?engine=google_lens&api_key=${process.env.SERPAPI_KEY}&url=${encodeURIComponent(imageUrl)}`
+  );
+
+  if (!serpApiResponse.ok) {
+    throw new Error("Failed to fetch initial results from SerpAPI");
+  }
+
+  const serpData: SerpApiResponse = await serpApiResponse.json();
+  return serpData.visual_matches.map(product => ({
+    ...product,
+    category: 'Initial',
+    croppedImageUrl: imageUrl
+  }));
+}
+
+
 async function cropAndUploadImage(imageBuffer: Buffer, object: DetectedObject, originalFileName: string): Promise<string> {
   const { normalizedVertices } = object.boundingPoly;
   
-  // Get image dimensions using sharp
   const image = sharp(imageBuffer);
   const metadata = await image.metadata();
   const imageWidth = metadata.width || 0;
   const imageHeight = metadata.height || 0;
 
-  // Calculate crop dimensions
   const left = Math.floor(normalizedVertices[0].x * imageWidth);
   const top = Math.floor(normalizedVertices[0].y * imageHeight);
   const width = Math.floor((normalizedVertices[1].x - normalizedVertices[0].x) * imageWidth);
@@ -124,18 +135,14 @@ async function cropAndUploadImage(imageBuffer: Buffer, object: DetectedObject, o
   return `${process.env.CLOUDFLARE_PUBLIC_URL}/${croppedFileName}`;
 }
 
-// Function to get visual matches
-export async function getVisualMatches(imageId: string): Promise<(Product & { category: string; croppedImageUrl: string })[]> {
+export async function getDetectedObjectResults(imageId: string): Promise<{ name: string; croppedImageUrl: string; products: Product[] }[]> {
   if (!process.env.SERPAPI_KEY) {
     throw new Error("SERPAPI_KEY is not defined");
   }
 
   const imageUrl = `${process.env.CLOUDFLARE_PUBLIC_URL}/${imageId}`;
 
-  // FIXME: In a production environment, this hash should be stored securely and not hardcoded
   const DUPE_API_HASH = "8dobGpMaw";
-
-  // Step 1: Use Dupe API to segment the image
   const dupeResponse = await fetch('https://dupe.com/api/vision', {
     method: 'POST',
     headers: {
@@ -155,44 +162,42 @@ export async function getVisualMatches(imageId: string): Promise<(Product & { ca
   const dupeData = await dupeResponse.json();
   const detectedObjects: DetectedObject[] = dupeData[0]?.localizedObjectAnnotations || [];
 
-  // Download the original image
+  const deduplicatedDetectedObjects = detectedObjects.filter((object, index) => {
+    return detectedObjects.findIndex(otherObject => otherObject.boundingPoly.normalizedVertices[0].x === object.boundingPoly.normalizedVertices[0].x) === index;
+  });
+
   const imageResponse = await fetch(imageUrl);
   const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
 
-  // Step 2: Crop, upload, and fetch products for each detected object
-  const allProducts: (Product & { category: string; croppedImageUrl: string })[] = [];
-
-  for (const object of detectedObjects) {
+  const objectResults = await Promise.all(deduplicatedDetectedObjects.map(async (object) => {
     try {
       const croppedImageUrl = await cropAndUploadImage(imageBuffer, object, imageId);
 
       const serpApiResponse = await fetch(
-        `https://serpapi.com/search.json?engine=google_lens&api_key=${process.env.SERPAPI_KEY}&url=${encodeURIComponent(croppedImageUrl)}`
+        `https://serpapi.com/search.json?engine=google_lens&api_key=${process.env.SERPAPI_KEY}&url=${encodeURIComponent(croppedImageUrl)}&crop=${object.boundingPoly.normalizedVertices.map(v => `${v.x},${v.y}`).join(',')}`
       );
 
       if (!serpApiResponse.ok) {
-        console.error(`Failed to fetch data from SerpAPI for object: ${object.name}`);
-        continue;
+        throw new Error(`Failed to fetch data from SerpAPI for object: ${object.name}`);
       }
 
       const serpData: SerpApiResponse = await serpApiResponse.json();
-      const products = serpData.visual_matches || [];
-
-      // Add object name and cropped image URL to each product for reference
-      const productsWithCategory = products.map((product: Product) => ({
+      const products: Product[] = (serpData.visual_matches || []).map((product: Omit<Product, 'category' | 'croppedImageUrl'>) => ({
         ...product,
         category: object.name,
         croppedImageUrl
       }));
 
-      allProducts.push(...productsWithCategory);
+      return {
+        name: object.name,
+        croppedImageUrl,
+        products
+      };
     } catch (error) {
       console.error(`Error processing object ${object.name}:`, error);
+      return null;
     }
-  }
+  }));
 
-  // log all croppedImageUrls
-  console.log(allProducts.map(product => product.croppedImageUrl));
-
-  return allProducts;
+  return objectResults.filter((result): result is { name: string; croppedImageUrl: string; products: Product[] } => result !== null);
 }
