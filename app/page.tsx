@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState } from "react";
-import { uploadImage } from "./actions";
+import React, { useState, useMemo } from "react";
+import { uploadImage, getVisualMatches } from "./actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,7 +15,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { CloudUpload, Loader2 } from "lucide-react";
-import { getVisualMatches } from "./actions";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface UploadFormProps {
   onUploadSuccess: (imageId: string, imageUrl: string) => void;
@@ -26,16 +32,19 @@ export interface Product {
   link: string;
   thumbnail: string;
   price?: {
-    value?: {
-      value: string;
-      extracted_value: number;
-      currency: string;
-    }
+    value: string;
+    extracted_value: number;
+    currency: string;
   };
   source: string;
 }
 
-// UploadForm Component
+export interface DetectedObject {
+  name: string;
+  croppedImageUrl: string;
+  products: Product[];
+}
+
 function UploadForm({ onUploadSuccess }: UploadFormProps) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -63,7 +72,7 @@ function UploadForm({ onUploadSuccess }: UploadFormProps) {
       formData.append("image", file);
       const result = await uploadImage(formData);
 
-      if ('error' in result) {
+      if ("error" in result) {
         throw new Error(result.error);
       }
 
@@ -125,21 +134,21 @@ function UploadForm({ onUploadSuccess }: UploadFormProps) {
 function ProductGrid({ products }: { products: Product[] }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-      {products.map((product, index) => (
-        <Card key={index}>
-          <CardHeader>
-            <CardTitle className="text-lg">{product.title}</CardTitle>
-            <CardDescription>{product.source}</CardDescription>
+      {products.filter((product) => product.price).map((product, index) => (
+        <Card key={index} className="overflow-hidden">
+          <img
+            src={product.thumbnail}
+            alt={product.title}
+            className="w-full h-48 object-cover"
+          />
+          <CardHeader className="p-4">
+            <CardTitle className="text-lg truncate">{product.title}</CardTitle>
+            <CardDescription className="text-sm">{product.source}</CardDescription>
           </CardHeader>
-          <CardContent>
-            <img
-              src={product.thumbnail}
-              alt={product.title}
-              className="w-full h-48 object-cover mb-2"
-            />
+          <CardContent className="p-4">
             {renderPrice(product.price)}
           </CardContent>
-          <CardFooter>
+          <CardFooter className="p-4">
             <Button asChild className="w-full">
               <a href={product.link} target="_blank" rel="noopener noreferrer">
                 View Product
@@ -152,19 +161,51 @@ function ProductGrid({ products }: { products: Product[] }) {
   );
 }
 
-function renderPrice(price: Product['price']) {
-  if (!price || !price.value || !price.value.value) {
+function renderPrice(price: Product["price"]) {
+  if (!price || !price.extracted_value) {
     return <p>Price not available</p>;
   }
-  
-  return <p className="text-lg font-bold">{price.value.value}</p>;
+
+  return <p className="text-lg font-bold">${price.extracted_value.toFixed(2)}</p>;
+}
+
+function ObjectSelector({
+  objects,
+  selectedObject,
+  onObjectChange,
+}: {
+  objects: DetectedObject[];
+  selectedObject: DetectedObject | null;
+  onObjectChange: (object: DetectedObject) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2 mb-4">
+      {objects.map((object) => (
+        <Button
+          key={object.croppedImageUrl}
+          variant={selectedObject === object ? "default" : "outline"}
+          onClick={() => onObjectChange(object)}
+          className="flex items-center gap-2"
+        >
+          <img
+            src={object.croppedImageUrl}
+            alt={object.name}
+            className="w-6 h-6 object-cover rounded"
+          />
+          {object.name}
+        </Button>
+      ))}
+    </div>
+  );
 }
 
 export default function Home() {
   const [uploadedImageId, setUploadedImageId] = useState<string | null>(null);
   const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null);
-  const [products, setProducts] = useState<Product[]>([]);
+  const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
+  const [selectedObject, setSelectedObject] = useState<DetectedObject | null>(null);
   const [loading, setLoading] = useState(false);
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
 
   const handleUploadSuccess = async (imageId: string, imageUrl: string) => {
     setUploadedImageId(imageId);
@@ -172,13 +213,37 @@ export default function Home() {
     setLoading(true);
     try {
       const fetchedProducts = await getVisualMatches(imageId);
-      setProducts(fetchedProducts);
+      const groupedObjects = fetchedProducts.reduce((acc, product) => {
+        const existingObject = acc.find(obj => obj.croppedImageUrl === product.croppedImageUrl);
+        if (existingObject) {
+          existingObject.products.push(product);
+        } else {
+          acc.push({
+            name: product.category,
+            croppedImageUrl: product.croppedImageUrl,
+            products: [product]
+          });
+        }
+        return acc;
+      }, [] as DetectedObject[]);
+      
+      setDetectedObjects(groupedObjects);
+      setSelectedObject(groupedObjects[0] || null);
     } catch (error) {
       console.error("Error fetching similar products:", error);
     } finally {
       setLoading(false);
     }
   };
+
+  const sortedProducts = useMemo(() => {
+    if (!selectedObject) return [];
+    return [...selectedObject.products].sort((a, b) => {
+      const priceA = a.price?.extracted_value || 0;
+      const priceB = b.price?.extracted_value || 0;
+      return sortOrder === "asc" ? priceA - priceB : priceB - priceA;
+    });
+  }, [selectedObject, sortOrder]);
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-between p-4 md:p-24">
@@ -200,10 +265,29 @@ export default function Home() {
             </h2>
             {uploadedImageUrl && (
               <div className="mb-4 text-center">
-                <img src={uploadedImageUrl} alt="Uploaded Image" className="max-w-full h-auto mx-auto" style={{maxHeight: '300px'}} />
+                <img
+                  src={uploadedImageUrl}
+                  alt="Uploaded Image"
+                  className="max-w-full h-auto mx-auto"
+                  style={{ maxHeight: "300px" }}
+                />
               </div>
             )}
-            <ProductGrid products={products} />
+            <ObjectSelector
+              objects={detectedObjects}
+              selectedObject={selectedObject}
+              onObjectChange={setSelectedObject}
+            />
+            <Select onValueChange={(value) => setSortOrder(value as "asc" | "desc")}>
+              <SelectTrigger className="w-[180px] mb-4">
+                <SelectValue placeholder="Sort by price" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="asc">Price: Low to High</SelectItem>
+                <SelectItem value="desc">Price: High to Low</SelectItem>
+              </SelectContent>
+            </Select>
+            <ProductGrid products={sortedProducts} />
           </>
         )}
       </div>
